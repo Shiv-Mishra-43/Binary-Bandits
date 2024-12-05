@@ -1,0 +1,123 @@
+from flask import Flask, jsonify, request
+import pandas as pd
+import sqlite3
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+import requests
+
+app = Flask(__name__)
+
+# Constants
+DB_FILE = 'covid_data.db'
+MODEL_FILE = 'lstm_model.h5'
+COVID_API_URL = "https://api.covid19api.com/dayone/country/india/status/confirmed/live"
+THRESHOLD = 1000  # Example threshold for pandemic alert
+
+
+# Initialize database
+def initialize_database():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS covid_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT UNIQUE,
+        cases INTEGER,
+        daily_new_cases INTEGER
+    )''')
+    conn.commit()
+    conn.close()
+
+
+# Save data to database
+def save_to_database(df):
+    conn = sqlite3.connect(DB_FILE)
+    df.to_sql('covid_data', conn, if_exists='replace', index=False)
+    conn.close()
+
+
+# Fetch data from database
+def fetch_from_database():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM covid_data", conn)
+    conn.close()
+    return df
+
+
+# Fetch live COVID-19 data from API
+def fetch_covid_data():
+    response = requests.get(COVID_API_URL)
+    if response.status_code == 200:
+        data = response.json()
+        df = pd.DataFrame(data)
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.groupby('Date').sum().reset_index()
+        df['Daily_New_Cases'] = df['Cases'].diff().fillna(0).astype(int)
+        save_to_database(df)
+        return df
+    else:
+        print("Failed to fetch data from API")
+        return None
+
+
+# Prepare data for prediction
+def prepare_prediction_data(data, window_size=7):
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(data['Daily_New_Cases'].values.reshape(-1, 1))
+    X = []
+    for i in range(window_size, len(scaled_data)):
+        X.append(scaled_data[i-window_size:i, 0])
+    X = np.array(X).reshape(-1, window_size, 1)
+    return X, scaler
+
+
+@app.route('/data', methods=['GET'])
+def get_data():
+    """
+    Endpoint to fetch COVID-19 data from the database.
+    """
+    data = fetch_from_database()
+    return data.to_json(orient='records')
+
+
+@app.route('/threshold', methods=['GET'])
+def check_threshold():
+    """
+    Endpoint to check if the threshold has been crossed.
+    """
+    data = fetch_from_database()
+    if data['daily_new_cases'].max() > THRESHOLD:
+        return jsonify({"pandemic": True, "message": "Threshold crossed!"})
+    return jsonify({"pandemic": False, "message": "Below threshold"})
+
+
+@app.route('/predict', methods=['GET'])
+def predict_next_day_cases():
+    """
+    Endpoint to predict the next day's cases using the LSTM model.
+    """
+    data = fetch_from_database()
+    if data is not None:
+        X, scaler = prepare_prediction_data(data)
+        model = load_model(MODEL_FILE)
+        future_cases_scaled = model.predict(X[-1].reshape(1, X.shape[1], 1))
+        future_cases = scaler.inverse_transform(future_cases_scaled)
+        return jsonify({"predicted_cases": int(future_cases[0][0])})
+    return jsonify({"error": "Data not available"}), 500
+
+
+@app.route('/refresh', methods=['GET'])
+def refresh_data():
+    """
+    Endpoint to refresh COVID-19 data from the API.
+    """
+    data = fetch_covid_data()
+    if data is not None:
+        return jsonify({"message": "Data refreshed successfully!"})
+    return jsonify({"error": "Failed to refresh data"}), 500
+
+
+if __name__ == '__main__':
+    initialize_database()
+    fetch_covid_data()
+    app.run(debug=True)
